@@ -1049,6 +1049,49 @@ def print_banner_results(port_scan_results):
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
+    import argparse
+
+    # argparse is Python's standard library for handling command line arguments.
+    # It automatically generates --help output and handles errors cleanly.
+    parser = argparse.ArgumentParser(
+        prog="scanner.py",
+        description="Network Scanner v0.5 — AUTHORIZED USE ONLY",
+        epilog="Only scan networks you own or have explicit permission to scan."
+    )
+
+    # Positional argument — required, no flag needed
+    # python3 scanner.py 192.168.226.0/24
+    parser.add_argument(
+        "network",
+        nargs="?",          # Makes it optional so we can prompt if missing
+        help="Target network range in CIDR notation (e.g. 192.168.1.0/24)"
+    )
+
+    # Optional flag — custom output directory
+    # python3 scanner.py 192.168.226.0/24 --output ~/scans/engagement1
+    parser.add_argument(
+        "--output", "-o",
+        metavar="DIR",
+        help="Directory to save reports (default: ~/projects/network-scanner/reports)"
+    )
+
+    # Optional flag — skip CVE correlation for faster scans
+    # python3 scanner.py 192.168.226.0/24 --no-cve
+    parser.add_argument(
+        "--no-cve",
+        action="store_true",    # Flag only, no value needed — True if present
+        help="Skip CVE correlation (faster scans, no NVD queries)"
+    )
+
+    # Optional flag — show closed ports in terminal output
+    parser.add_argument(
+        "--show-closed",
+        action="store_true",
+        help="Show closed ports in port scan results"
+    )
+
+    args = parser.parse_args()
+
     print("""
 ╔══════════════════════════════════════╗
 ║      NETWORK SCANNER v0.5            ║
@@ -1061,8 +1104,9 @@ def main():
 ╚══════════════════════════════════════╝
     """)
 
-    if len(sys.argv) == 2:
-        network_range = sys.argv[1]
+    # Get network range — from arg or prompt
+    if args.network:
+        network_range = args.network
     else:
         network_range = input(
             "[?] Enter network range (e.g. 192.168.226.0/24): ").strip()
@@ -1074,6 +1118,14 @@ def main():
         print("[!] Unauthorized scanning is illegal. Exiting.\n")
         sys.exit(1)
 
+    # Apply custom output directory if specified.
+    # We modify the global REPORTS_DIR so all report functions
+    # automatically use it without needing to pass it around.
+    if args.output:
+        global REPORTS_DIR
+        REPORTS_DIR = Path(args.output).expanduser().resolve()
+        print(f"[*] Output directory: {REPORTS_DIR}")
+
     # Stage 1 — host discovery
     found = discover_hosts(network_range)
     print_discovery_results()
@@ -1084,17 +1136,22 @@ def main():
 
     # Stage 2 — port scan
     port_results = run_port_scan(found)
-    print_port_results(port_results, show_closed=False)
+    print_port_results(port_results, show_closed=args.show_closed)
 
     # Stage 3 — banner grab
     enriched_results = run_banner_grab(port_results)
     print_banner_results(enriched_results)
 
-    # Stage 5 — CVE correlation
-    enriched_results = run_cve_correlation(enriched_results)
-    print_cve_results(enriched_results)
+    # Stage 5 — CVE correlation (skippable with --no-cve)
+    if args.no_cve:
+        print("\n[*] Skipping CVE correlation (--no-cve flag set)")
+        for host, data in enriched_results.items():
+            data["cves"] = {}
+    else:
+        enriched_results = run_cve_correlation(enriched_results)
+        print_cve_results(enriched_results)
 
-    # Stage 4 — generate reports (runs after CVE data is ready)
+    # Stage 4 — generate reports
     generate_reports(enriched_results, network_range)
 
 
