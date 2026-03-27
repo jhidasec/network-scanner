@@ -20,7 +20,9 @@ grabbing, CVE correlation, and generates professional HTML/JSON reports.
   and styled HTML (human-readable) reports.
 - **Stage 5 — CVE Correlator:** Parses service banners to extract version 
   strings and queries the NVD API for known CVEs with CVSS scores.
-
+- **Stage 6 — Client PDF Report:** Generates a professional client-facing 
+  audit report with executive summary, risk ratings, per-host findings, 
+  CVE tables, recommendations, and scope documentation. Requires `reportlab`.
 ## Requirements
 
 - Python 3.10+
