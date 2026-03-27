@@ -27,21 +27,42 @@ grabbing, CVE correlation, and generates professional HTML/JSON reports.
 
 - Python 3.10+
 - Kali Linux or any Debian-based system
-- No external dependencies — uses Python standard library only
+- No external dependencies for Stages 1–5 — uses Python standard library only
+- `reportlab` (optional) for Stage 6 PDF client reports:
+```bash
+  pip install reportlab --break-system-packages
+```
 
 ## Usage
 ```bash
+# Basic scan
 python3 scanner.py 192.168.1.0/24
+
+# Full scan with PDF client report
+python3 scanner.py 192.168.1.0/24 --name "Your Name" --contact "you@email.com"
+
+# Skip CVE correlation (faster)
+python3 scanner.py 192.168.1.0/24 --no-cve
+
+# Skip PDF report generation
+python3 scanner.py 192.168.1.0/24 --no-pdf
+
+# Custom output directory
+python3 scanner.py 192.168.1.0/24 --output ~/engagements/client1
+
+# Show closed ports in terminal output
+python3 scanner.py 192.168.1.0/24 --show-closed
 ```
 
-The target network must be added to the `AUTHORIZED_NETWORKS` list in the 
-script before scanning.
+The target network must be added to the `AUTHORIZED_NETWORKS` 
+list in the script before scanning.
 
 ## Output
 
 Reports are saved to `~/projects/network-scanner/reports/` as:
 - `scan_YYYYMMDD_HHMMSS.json`
 - `scan_YYYYMMDD_HHMMSS.html`
+- `audit_report_YYYYMMDD_HHMMSS.pdf` *(client-facing, requires reportlab)*
 
 ## Project Structure
 ```
