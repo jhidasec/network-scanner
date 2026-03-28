@@ -1595,7 +1595,7 @@ def generate_pdf_report(report_data, consultant_name="Your Name",
                              color=ACCENT, spaceAfter=8))
     story.append(Paragraph(
         f"This assessment was conducted against the <b>{meta['network']}</b> "
-        f"network on <b>{meta['scan_date']}</b> using Network Scanner v0.5. "
+        f"network on <b>{meta['scan_date']}</b> using Network Scanner v0.6. "
         f"The following techniques were employed:", ST["body"]))
     story.append(Spacer(1, 0.08*inch))
 
