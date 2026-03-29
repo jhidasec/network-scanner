@@ -962,6 +962,20 @@ def generate_html_report(report_data):
                       "Open Ports Present" if open_ports else
                       "Minimal Exposure")
 
+        # ── Web tech section ──────────────────────────────────────────────
+        web_tech = data.get("web_tech", [])
+        if web_tech:
+            badges = "".join(
+                f'<span class="tech-badge">{t}</span>' for t in web_tech
+            )
+            web_tech_section = (
+                f'<div class="web-tech-section">'
+                f'<span class="web-tech-label">Web Technologies</span>'
+                f'{badges}</div>'
+            )
+        else:
+            web_tech_section = ""
+
         host_cards += f"""
         <div class="host-card">
             <div class="host-header">
@@ -977,6 +991,7 @@ def generate_html_report(report_data):
                 </div>
                 {open_table}
                 {filtered_section}
+                {web_tech_section}
             </div>
         </div>"""
 
@@ -1092,6 +1107,14 @@ def generate_html_report(report_data):
         .filtered-list {{
             font-size: 0.82rem; color: #8b949e; margin-top: 0.5rem;
         }}
+        .web-tech-section {{ margin-top: 10px; }}
+        .web-tech-label {{ font-size: 0.75em; font-weight: 600; color: #5a6a82;
+                          text-transform: uppercase; letter-spacing: 0.05em;
+                          margin-right: 8px; }}
+        .tech-badge {{ display: inline-block; background: #e8f0fe; color: #1a73e8;
+                      border: 1px solid #c5d8fb; border-radius: 12px;
+                      font-size: 0.78em; font-weight: 600; padding: 2px 10px;
+                      margin: 2px 3px 2px 0; }}
         .no-findings {{
             color: #484f58; font-style: italic; font-size: 0.9rem;
         }}
