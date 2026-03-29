@@ -272,9 +272,13 @@ def run_web_fingerprint(enriched_results):
 
     print(f"  Scanning {len(web_hosts)} HTTP/HTTPS host(s)...\n")
 
+    web_host_set = set(web_hosts)
     for host, data in enriched_results.items():
-        open_port_nums  = {p for p, _ in data.get("open", [])}
-        data["web_tech"] = fingerprint_web_tech(host, open_port_nums)
+        if host in web_host_set:
+            open_port_nums = {p for p, _ in data.get("open", [])}
+            data["web_tech"] = fingerprint_web_tech(host, open_port_nums)
+        else:
+            data["web_tech"] = []
 
     return enriched_results
 
