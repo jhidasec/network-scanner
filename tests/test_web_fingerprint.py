@@ -85,6 +85,69 @@ def test_aspnet_via_session_cookie():
     assert "ASP.NET" in _match_header_sigs(headers)
 
 
+from scanner import _match_body_sigs
+
+
+def test_wordpress_wp_content_path():
+    body = '<link rel="stylesheet" href="/wp-content/themes/twentytwenty/style.css">'
+    assert "WordPress" in _match_body_sigs(body)
+
+
+def test_wordpress_meta_generator():
+    body = '<meta name="generator" content="WordPress 6.4.2" />'
+    assert "WordPress" in _match_body_sigs(body)
+
+
+def test_drupal_settings():
+    body = "var drupalSettings = {}; Drupal.settings = {};"
+    assert "Drupal" in _match_body_sigs(body)
+
+
+def test_nextjs_data_tag():
+    body = '<script id="__NEXT_DATA__" type="application/json">{"page":"/","query":{}}</script>'
+    assert "Next.js" in _match_body_sigs(body)
+
+
+def test_react_data_root():
+    body = '<div data-reactroot="" id="root"></div>'
+    assert "React" in _match_body_sigs(body)
+
+
+def test_angular_ng_version():
+    body = '<app-root _nghost-abc ng-version="17.0.0"></app-root>'
+    assert "Angular" in _match_body_sigs(body)
+
+
+def test_jquery_script_tag():
+    body = '<script src="/assets/jquery.min.js"></script>'
+    assert "jQuery" in _match_body_sigs(body)
+
+
+def test_bootstrap_link_tag():
+    body = '<link rel="stylesheet" href="/css/bootstrap.min.css">'
+    assert "Bootstrap" in _match_body_sigs(body)
+
+
+def test_bootstrap_not_matched_in_body_text():
+    # "bootstrap" in plain text (not a <link> tag) should NOT match
+    body = "<p>We bootstrap our app on startup.</p>"
+    assert "Bootstrap" not in _match_body_sigs(body)
+
+
+def test_joomla_administrator_path():
+    body = '<a href="/administrator/index.php">Admin</a>'
+    assert "Joomla" in _match_body_sigs(body)
+
+
+def test_empty_body_returns_empty_set():
+    assert _match_body_sigs("") == set()
+
+
+def test_plain_html_no_signatures():
+    body = "<html><body><h1>Hello World</h1></body></html>"
+    assert _match_body_sigs(body) == set()
+
+
 if __name__ == "__main__":
     import unittest
     # Run as: python3 tests/test_web_fingerprint.py

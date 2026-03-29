@@ -188,6 +188,20 @@ def _match_header_sigs(headers):
     return found
 
 
+def _match_body_sigs(body):
+    """
+    Match HTML body text against WEB_BODY_SIGS.
+
+    body: string containing the first 8 KB of the HTTP response body
+    Returns a set of technology label strings.
+    """
+    found = set()
+    for pattern, label in WEB_BODY_SIGS:
+        if re.search(pattern, body):
+            found.add(label)
+    return found
+
+
 # ─── AUTHORIZATION ────────────────────────────────────────────────────────────
 
 def is_authorized(network):
