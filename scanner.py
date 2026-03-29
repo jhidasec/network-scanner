@@ -133,7 +133,7 @@ WEB_HEADER_SIGS = {
     ],
     "x-powered-by": [
         (r"PHP/[\d.]+",     None),       # None → use matched text, e.g. "PHP/8.1.2"
-        (r"ASP\.NET",       "ASP.NET"),
+        (r"ASP\.NET\b",     "ASP.NET"),
         (r"Express",        "Express.js"),
     ],
     "x-drupal-cache":  [(r".*",            "Drupal")],

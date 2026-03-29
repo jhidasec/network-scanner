@@ -65,6 +65,26 @@ def test_unknown_headers_ignored():
     assert _match_header_sigs(headers) == set()
 
 
+def test_iis_server_header():
+    headers = {"server": "Microsoft-IIS/10.0"}
+    assert "IIS" in _match_header_sigs(headers)
+
+
+def test_litespeed_server_header():
+    headers = {"server": "LiteSpeed"}
+    assert "LiteSpeed" in _match_header_sigs(headers)
+
+
+def test_drupal_via_x_generator():
+    headers = {"x-generator": "Drupal 10 (https://www.drupal.org)"}
+    assert "Drupal" in _match_header_sigs(headers)
+
+
+def test_aspnet_via_session_cookie():
+    headers = {"set-cookie": "ASP.NET_SessionId=abc123; path=/"}
+    assert "ASP.NET" in _match_header_sigs(headers)
+
+
 if __name__ == "__main__":
     import unittest
     # Run as: python3 tests/test_web_fingerprint.py
