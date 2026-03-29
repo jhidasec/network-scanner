@@ -843,7 +843,8 @@ def prepare_report_data(enriched_results, network_range):
             "summary": {
                 "open_count":     len(open_ports),
                 "filtered_count": len(filtered_ports),
-            }
+            },
+            "web_tech": data.get("web_tech", []),
         }
 
     report["metadata"]["total_open_ports"] = total_open
@@ -2000,13 +2001,14 @@ def main():
 
     print("""
 ╔══════════════════════════════════════╗
-║      NETWORK SCANNER v0.6            ║
+║      NETWORK SCANNER v0.7            ║
 ║      Stage 1: Host Discovery         ║
 ║      Stage 2: Port Scanner           ║
 ║      Stage 3: Banner Grabber         ║
 ║      Stage 4: Report Generator       ║
 ║      Stage 5: CVE Correlator         ║
 ║      Stage 6: Client PDF Report      ║
+║      Stage 7: Web Tech Fingerprint   ║
 ║      AUTHORIZED USE ONLY             ║
 ╚══════════════════════════════════════╝
     """)
@@ -2048,6 +2050,10 @@ def main():
     # Stage 3 — banner grab
     enriched_results = run_banner_grab(port_results)
     print_banner_results(enriched_results)
+
+    # Stage 7 — web technology fingerprinting
+    enriched_results = run_web_fingerprint(enriched_results)
+    print_web_tech_results(enriched_results)
 
     # Stage 5 — CVE correlation (skippable with --no-cve)
     if args.no_cve:
