@@ -120,6 +120,74 @@ SKIP_BANNERS = {
     "HTTPS service (no Server header)",
 }
 
+# ─── STAGE 7 CONFIGURATION ────────────────────────────────────────────────────
+
+# Header signatures: {lowercase_header_name: [(regex_pattern, label_or_None), ...]}
+# label=None means use the regex match text directly as the label (e.g. "PHP/8.1.2")
+WEB_HEADER_SIGS = {
+    "server": [
+        (r"Apache",         "Apache"),
+        (r"nginx",          "nginx"),
+        (r"Microsoft-IIS",  "IIS"),
+        (r"LiteSpeed",      "LiteSpeed"),
+    ],
+    "x-powered-by": [
+        (r"PHP/[\d.]+",     None),       # None → use matched text, e.g. "PHP/8.1.2"
+        (r"ASP\.NET",       "ASP.NET"),
+        (r"Express",        "Express.js"),
+    ],
+    "x-drupal-cache":  [(r".*",            "Drupal")],
+    "x-generator":     [(r"Drupal",        "Drupal")],
+    "set-cookie": [
+        (r"PHPSESSID",          "PHP"),
+        (r"JSESSIONID",         "Java"),
+        (r"ASP\.NET_SessionId", "ASP.NET"),
+        (r"laravel_session",    "Laravel"),
+    ],
+    "link": [(r"api\.w\.org", "WordPress")],
+}
+
+# Body signatures: [(regex_pattern, label), ...] applied to first 8 KB of body
+WEB_BODY_SIGS = [
+    (r"/wp-content/|/wp-includes/",          "WordPress"),
+    (r"/sites/default/files/",               "Drupal"),
+    (r"Drupal\.settings",                    "Drupal"),
+    (r"/administrator/index\.php",           "Joomla"),
+    (r"Mage\.Cookies",                       "Magento"),
+    (r"__NEXT_DATA__",                       "Next.js"),
+    (r"__nuxt",                              "Nuxt.js"),
+    (r"data-reactroot|data-reactid",         "React"),
+    (r"ng-version",                          "Angular"),
+    (r"<meta[^>]+generator[^>]+WordPress",   "WordPress"),
+    (r"<meta[^>]+generator[^>]+Drupal",      "Drupal"),
+    (r"<meta[^>]+generator[^>]+Joomla",      "Joomla"),
+    (r"(?i)jquery",                          "jQuery"),
+    (r"(?i)<link[^>]+bootstrap",             "Bootstrap"),
+]
+
+TIMEOUT_S7 = 3.0
+BODY_READ_LIMIT = 8192   # 8 KB — enough for meta tags and script paths
+
+
+def _match_header_sigs(headers):
+    """
+    Match a dict of HTTP response headers against WEB_HEADER_SIGS.
+
+    headers: dict of {lowercase_header_name: header_value_string}
+    Returns a set of technology label strings.
+    """
+    found = set()
+    for header_name, patterns in WEB_HEADER_SIGS.items():
+        value = headers.get(header_name, "")
+        if not value:
+            continue
+        for pattern, label in patterns:
+            m = re.search(pattern, value, re.IGNORECASE)
+            if m:
+                found.add(m.group(0) if label is None else label)
+    return found
+
+
 # ─── AUTHORIZATION ────────────────────────────────────────────────────────────
 
 def is_authorized(network):
