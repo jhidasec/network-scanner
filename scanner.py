@@ -202,6 +202,101 @@ def _match_body_sigs(body):
     return found
 
 
+def fingerprint_web_tech(host, open_port_nums):
+    """
+    Make a single GET / request to the host and return a sorted list of
+    detected web technologies.
+
+    Tries HTTPS (port 443) first with SSL verification disabled (self-signed
+    certs are common in home labs). Falls back to HTTP (port 80).
+    Returns [] if neither port is open or if the request fails.
+
+    open_port_nums: set of integer port numbers open on this host
+    """
+    if 443 in open_port_nums:
+        use_ssl = True
+    elif 80 in open_port_nums:
+        use_ssl = False
+    else:
+        return []
+
+    try:
+        scheme = "https" if use_ssl else "http"
+        url    = f"{scheme}://{host}/"
+        req    = urllib.request.Request(
+            url, headers={"User-Agent": "NetworkScanner/0.7"}
+        )
+
+        if use_ssl:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            resp_ctx = urllib.request.urlopen(req, timeout=TIMEOUT_S7,
+                                              context=ctx)
+        else:
+            resp_ctx = urllib.request.urlopen(req, timeout=TIMEOUT_S7)
+
+        with resp_ctx as resp:
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+            body    = resp.read(BODY_READ_LIMIT).decode("utf-8", errors="ignore")
+
+        tech = _match_header_sigs(headers) | _match_body_sigs(body)
+        return sorted(tech)
+
+    except Exception:
+        return []
+
+
+def run_web_fingerprint(enriched_results):
+    """
+    Stage 7: fingerprint web technologies on all hosts with port 80 or 443 open.
+
+    Mutates enriched_results in-place: adds a 'web_tech' key (list of strings)
+    to every host entry. Hosts without port 80/443 get web_tech=[].
+    Returns enriched_results.
+    """
+    web_hosts = [
+        host for host, data in enriched_results.items()
+        if any(p in {80, 443} for p, _ in data.get("open", []))
+    ]
+
+    print(f"\n{'=' * 60}")
+    print(f"[Stage 7] Web Technology Fingerprinting")
+    print(f"{'=' * 60}")
+
+    if not web_hosts:
+        print("  No HTTP/HTTPS hosts found — skipping\n")
+        for data in enriched_results.values():
+            data["web_tech"] = []
+        return enriched_results
+
+    print(f"  Scanning {len(web_hosts)} HTTP/HTTPS host(s)...\n")
+
+    for host, data in enriched_results.items():
+        open_port_nums  = {p for p, _ in data.get("open", [])}
+        data["web_tech"] = fingerprint_web_tech(host, open_port_nums)
+
+    return enriched_results
+
+
+def print_web_tech_results(enriched_results):
+    """Print Stage 7 fingerprint results to the terminal."""
+    for host in sorted(enriched_results,
+                       key=lambda x: ipaddress.ip_address(x)):
+        data = enriched_results[host]
+        tech = data.get("web_tech", [])
+        is_web_host = any(
+            p in {80, 443} for p, _ in data.get("open", [])
+        )
+        if not is_web_host:
+            continue
+        if tech:
+            print(f"  {host}: {', '.join(tech)}")
+        else:
+            print(f"  {host}: No web technologies detected")
+    print()
+
+
 # ─── AUTHORIZATION ────────────────────────────────────────────────────────────
 
 def is_authorized(network):
