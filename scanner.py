@@ -22,6 +22,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
+# Database layer — optional, gracefully skipped if unavailable
+try:
+    from db import save_scan, init_db
+    DB_AVAILABLE = True
+except ImportError:
+    DB_AVAILABLE = False
+
 # Stage 6 — PDF report (requires: pip install reportlab)
 try:
     from reportlab.lib.pagesizes import letter
@@ -1875,7 +1882,11 @@ def main():
                      generate_pdf=not args.no_pdf,
                      consultant_name=args.name,
                      consultant_contact=args.contact)
-
+    # Save to database if available
+    if DB_AVAILABLE:
+        save_scan(enriched_results, network_range, client_id=None)
+    else:
+        print("[*] Database not configured — skipping db save")
 
 if __name__ == "__main__":
     main()
