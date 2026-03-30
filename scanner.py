@@ -120,6 +120,187 @@ SKIP_BANNERS = {
     "HTTPS service (no Server header)",
 }
 
+# ─── STAGE 7 CONFIGURATION ────────────────────────────────────────────────────
+
+# Header signatures: {lowercase_header_name: [(regex_pattern, label_or_None), ...]}
+# label=None means use the regex match text directly as the label (e.g. "PHP/8.1.2")
+WEB_HEADER_SIGS = {
+    "server": [
+        (r"Apache",         "Apache"),
+        (r"nginx",          "nginx"),
+        (r"Microsoft-IIS",  "IIS"),
+        (r"LiteSpeed",      "LiteSpeed"),
+    ],
+    "x-powered-by": [
+        (r"PHP/[\d.]+",     None),       # None → use matched text, e.g. "PHP/8.1.2"
+        (r"ASP\.NET\b",     "ASP.NET"),
+        (r"Express",        "Express.js"),
+    ],
+    "x-drupal-cache":  [(r".*",            "Drupal")],
+    "x-generator":     [(r"Drupal",        "Drupal")],
+    "set-cookie": [
+        (r"PHPSESSID",          "PHP"),
+        (r"JSESSIONID",         "Java"),
+        (r"ASP\.NET_SessionId", "ASP.NET"),
+        (r"laravel_session",    "Laravel"),
+    ],
+    "link": [(r"api\.w\.org", "WordPress")],
+}
+
+# Body signatures: [(regex_pattern, label), ...] applied to first 8 KB of body
+WEB_BODY_SIGS = [
+    (r"/wp-content/|/wp-includes/",          "WordPress"),
+    (r"/sites/default/files/",               "Drupal"),
+    (r"Drupal\.settings",                    "Drupal"),
+    (r"/administrator/index\.php",           "Joomla"),
+    (r"Mage\.Cookies",                       "Magento"),
+    (r"__NEXT_DATA__",                       "Next.js"),
+    (r"__nuxt",                              "Nuxt.js"),
+    (r"data-reactroot|data-reactid",         "React"),
+    (r"ng-version",                          "Angular"),
+    (r"<meta[^>]+generator[^>]+WordPress",   "WordPress"),
+    (r"<meta[^>]+generator[^>]+Drupal",      "Drupal"),
+    (r"<meta[^>]+generator[^>]+Joomla",      "Joomla"),
+    (r"(?i)jquery",                          "jQuery"),
+    (r"(?i)<link[^>]+bootstrap",             "Bootstrap"),
+]
+
+TIMEOUT_S7 = 3.0
+BODY_READ_LIMIT = 8192   # 8 KB — enough for meta tags and script paths
+
+
+def _match_header_sigs(headers):
+    """
+    Match a dict of HTTP response headers against WEB_HEADER_SIGS.
+
+    headers: dict of {lowercase_header_name: header_value_string}
+    Returns a set of technology label strings.
+    """
+    found = set()
+    for header_name, patterns in WEB_HEADER_SIGS.items():
+        value = headers.get(header_name, "")
+        if not value:
+            continue
+        for pattern, label in patterns:
+            m = re.search(pattern, value, re.IGNORECASE)
+            if m:
+                found.add(m.group(0) if label is None else label)
+    return found
+
+
+def _match_body_sigs(body):
+    """
+    Match HTML body text against WEB_BODY_SIGS.
+
+    body: string containing the first 8 KB of the HTTP response body
+    Returns a set of technology label strings.
+    """
+    found = set()
+    for pattern, label in WEB_BODY_SIGS:
+        if re.search(pattern, body):
+            found.add(label)
+    return found
+
+
+def fingerprint_web_tech(host, open_port_nums):
+    """
+    Make a single GET / request to the host and return a sorted list of
+    detected web technologies.
+
+    Tries HTTPS (port 443) first with SSL verification disabled (self-signed
+    certs are common in home labs). Falls back to HTTP (port 80).
+    Returns [] if neither port is open or if the request fails.
+
+    open_port_nums: set of integer port numbers open on this host
+    """
+    if 443 in open_port_nums:
+        use_ssl = True
+    elif 80 in open_port_nums:
+        use_ssl = False
+    else:
+        return []
+
+    try:
+        scheme = "https" if use_ssl else "http"
+        url    = f"{scheme}://{host}/"
+        req    = urllib.request.Request(
+            url, headers={"User-Agent": "NetworkScanner/0.7"}
+        )
+
+        if use_ssl:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode    = ssl.CERT_NONE
+            resp_ctx = urllib.request.urlopen(req, timeout=TIMEOUT_S7,
+                                              context=ctx)
+        else:
+            resp_ctx = urllib.request.urlopen(req, timeout=TIMEOUT_S7)
+
+        with resp_ctx as resp:
+            headers = {k.lower(): v for k, v in resp.headers.items()}
+            body    = resp.read(BODY_READ_LIMIT).decode("utf-8", errors="ignore")
+
+        tech = _match_header_sigs(headers) | _match_body_sigs(body)
+        return sorted(tech)
+
+    except Exception:
+        return []
+
+
+def run_web_fingerprint(enriched_results):
+    """
+    Stage 7: fingerprint web technologies on all hosts with port 80 or 443 open.
+
+    Mutates enriched_results in-place: adds a 'web_tech' key (list of strings)
+    to every host entry. Hosts without port 80/443 get web_tech=[].
+    Returns enriched_results.
+    """
+    web_hosts = [
+        host for host, data in enriched_results.items()
+        if any(p in {80, 443} for p, _ in data.get("open", []))
+    ]
+
+    print(f"\n{'=' * 60}")
+    print(f"[Stage 7] Web Technology Fingerprinting")
+    print(f"{'=' * 60}")
+
+    if not web_hosts:
+        print("  No HTTP/HTTPS hosts found — skipping\n")
+        for data in enriched_results.values():
+            data["web_tech"] = []
+        return enriched_results
+
+    print(f"  Scanning {len(web_hosts)} HTTP/HTTPS host(s)...\n")
+
+    web_host_set = set(web_hosts)
+    for host, data in enriched_results.items():
+        if host in web_host_set:
+            open_port_nums = {p for p, _ in data.get("open", [])}
+            data["web_tech"] = fingerprint_web_tech(host, open_port_nums)
+        else:
+            data["web_tech"] = []
+
+    return enriched_results
+
+
+def print_web_tech_results(enriched_results):
+    """Print Stage 7 fingerprint results to the terminal."""
+    for host in sorted(enriched_results,
+                       key=lambda x: ipaddress.ip_address(x)):
+        data = enriched_results[host]
+        tech = data.get("web_tech", [])
+        is_web_host = any(
+            p in {80, 443} for p, _ in data.get("open", [])
+        )
+        if not is_web_host:
+            continue
+        if tech:
+            print(f"  {host}: {', '.join(tech)}")
+        else:
+            print(f"  {host}: No web technologies detected")
+    print()
+
+
 # ─── AUTHORIZATION ────────────────────────────────────────────────────────────
 
 def is_authorized(network):
@@ -662,7 +843,8 @@ def prepare_report_data(enriched_results, network_range):
             "summary": {
                 "open_count":     len(open_ports),
                 "filtered_count": len(filtered_ports),
-            }
+            },
+            "web_tech": data.get("web_tech", []),
         }
 
     report["metadata"]["total_open_ports"] = total_open
@@ -780,6 +962,20 @@ def generate_html_report(report_data):
                       "Open Ports Present" if open_ports else
                       "Minimal Exposure")
 
+        # ── Web tech section ──────────────────────────────────────────────
+        web_tech = data.get("web_tech", [])
+        if web_tech:
+            badges = "".join(
+                f'<span class="tech-badge">{t}</span>' for t in web_tech
+            )
+            web_tech_section = (
+                f'<div class="web-tech-section">'
+                f'<span class="web-tech-label">Web Technologies</span>'
+                f'{badges}</div>'
+            )
+        else:
+            web_tech_section = ""
+
         host_cards += f"""
         <div class="host-card">
             <div class="host-header">
@@ -795,6 +991,7 @@ def generate_html_report(report_data):
                 </div>
                 {open_table}
                 {filtered_section}
+                {web_tech_section}
             </div>
         </div>"""
 
@@ -910,6 +1107,14 @@ def generate_html_report(report_data):
         .filtered-list {{
             font-size: 0.82rem; color: #8b949e; margin-top: 0.5rem;
         }}
+        .web-tech-section {{ margin-top: 10px; }}
+        .web-tech-label {{ font-size: 0.75em; font-weight: 600; color: #5a6a82;
+                          text-transform: uppercase; letter-spacing: 0.05em;
+                          margin-right: 8px; }}
+        .tech-badge {{ display: inline-block; background: #e8f0fe; color: #1a73e8;
+                      border: 1px solid #c5d8fb; border-radius: 12px;
+                      font-size: 0.78em; font-weight: 600; padding: 2px 10px;
+                      margin: 2px 3px 2px 0; }}
         .no-findings {{
             color: #484f58; font-style: italic; font-size: 0.9rem;
         }}
@@ -1819,13 +2024,14 @@ def main():
 
     print("""
 ╔══════════════════════════════════════╗
-║      NETWORK SCANNER v0.6            ║
+║      NETWORK SCANNER v0.7            ║
 ║      Stage 1: Host Discovery         ║
 ║      Stage 2: Port Scanner           ║
 ║      Stage 3: Banner Grabber         ║
 ║      Stage 4: Report Generator       ║
 ║      Stage 5: CVE Correlator         ║
 ║      Stage 6: Client PDF Report      ║
+║      Stage 7: Web Tech Fingerprint   ║
 ║      AUTHORIZED USE ONLY             ║
 ╚══════════════════════════════════════╝
     """)
@@ -1867,6 +2073,10 @@ def main():
     # Stage 3 — banner grab
     enriched_results = run_banner_grab(port_results)
     print_banner_results(enriched_results)
+
+    # Stage 7 — web technology fingerprinting
+    enriched_results = run_web_fingerprint(enriched_results)
+    print_web_tech_results(enriched_results)
 
     # Stage 5 — CVE correlation (skippable with --no-cve)
     if args.no_cve:
