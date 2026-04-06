@@ -1547,6 +1547,12 @@ def main():
         help="Your contact info for the PDF report cover"
     )
     parser.add_argument(
+        "--email",
+        metavar="EMAIL",
+        default=None,
+        help="Send PDF report to this email address after scan"
+    )
+    parser.add_argument(
         "--client-id",
         metavar="ID",
         type=int,
@@ -1617,13 +1623,34 @@ def main():
                      generate_pdf=not args.no_pdf,
                      consultant_name=args.name,
                      consultant_contact=args.contact)
-
     # Database save
     if DB_AVAILABLE:
         save_scan(enriched_results, network_range,
                   client_id=args.client_id)
     else:
         print("[*] Database not configured — skipping db save")
+
+    # Email delivery — only if client email provided
+    if args.email and args.client_id:
+        try:
+            from mailer import send_report
+            # Find the most recently generated PDF
+            pdf_files = sorted(
+                REPORTS_DIR.glob("audit_report_*.pdf"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True
+            )
+            if pdf_files:
+                send_report(
+                    recipient_email = args.email,
+                    client_name     = args.name,
+                    network_range   = network_range,
+                    pdf_path        = str(pdf_files[0])
+                )
+            else:
+                print("[!] No PDF found to email")
+        except ImportError:
+            print("[*] mailer.py not found — skipping email delivery")
 
 
 if __name__ == "__main__":
