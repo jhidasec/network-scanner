@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Network Scanner - All Stages: Host Discovery + Port Scanner + Banner Grabber
-                              + Report Generator + CVE Correlator
-Author: You
+                              + Report Generator + CVE Correlator + Client PDF
+Author: Jeffrey Hidalgo
 Purpose: Full reconnaissance pipeline from host discovery to CVE correlation
 AUTHORIZED USE ONLY - Only scan networks you own or have explicit permission to scan
 """
@@ -22,17 +22,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
-# Database layer — optional, gracefully skipped if unavailable
-try:
-    from db import save_scan, init_db
-    DB_AVAILABLE = True
-except ImportError:
-    DB_AVAILABLE = False
-
 # Stage 6 — PDF report (requires: pip install reportlab)
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.lib import colors
+    from reportlab.lib.colors import HexColor
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     from reportlab.lib.units import inch
     from reportlab.lib.enums import TA_LEFT, TA_CENTER, TA_RIGHT
@@ -43,29 +37,66 @@ try:
 except ImportError:
     REPORTLAB_AVAILABLE = False
 
+# Database layer — optional, gracefully skipped if unavailable
+try:
+    from db import save_scan, init_db
+    DB_AVAILABLE = True
+except ImportError:
+    DB_AVAILABLE = False
+
 # ─── STAGE 1 CONFIGURATION ────────────────────────────────────────────────────
 
-# Multiple probe ports — host is considered alive if ANY of these respond.
-#   22   — SSH, open on virtually every Linux VM by default
-#   80   — HTTP, common on routers, printers, web servers, IoT devices
-#   443  — HTTPS, common on modern web servers and appliances
-#   445  — SMB, almost always open on Windows machines internally
 PROBE_PORTS = [22, 80, 443, 445]
-
 TIMEOUT_S1  = 0.5
 MAX_THREADS = 100
 
 live_hosts = []
 lock = threading.Lock()
 
-AUTHORIZED_NETWORKS = [
-    "192.168.1.0/24",
-    "192.168.0.0/24",
-    "10.0.0.0/24",
-    "172.16.0.0/24",
-    "192.168.226.0/24",
-    "192.168.200.0/24",
-]
+# ─── AUTHORIZED NETWORKS ──────────────────────────────────────────────────────
+# Loaded from networks.conf at runtime — never hardcoded, never committed.
+# Add client networks to networks.conf only, not to this file.
+
+def load_authorized_networks():
+    """
+    Load authorized network ranges from networks.conf.
+
+    networks.conf lives in the same directory as scanner.py and is
+    gitignored — client network ranges never appear in the public repo.
+
+    Format: one CIDR range per line, # for comments, blank lines ignored.
+    Returns a set of authorized network strings.
+    """
+    config_path = Path(__file__).parent / "networks.conf"
+
+    if not config_path.exists():
+        print(f"[!] networks.conf not found at {config_path}")
+        print("[!] Create it with your authorized network ranges.")
+        print("[!] See networks.conf.example for format.")
+        sys.exit(1)
+
+    networks = set()
+    with open(config_path, "r") as f:
+        for line in f:
+            line = line.split("#")[0].strip()
+            if not line:
+                continue
+            try:
+                ipaddress.ip_network(line, strict=False)
+                networks.add(line)
+            except ValueError:
+                print(f"[!] Skipping invalid network in networks.conf: {line}")
+
+    return networks
+
+
+AUTHORIZED_NETWORKS = load_authorized_networks()
+
+
+def is_authorized(network):
+    """Check if the target network is in our authorized list."""
+    return network in AUTHORIZED_NETWORKS
+
 
 # ─── STAGE 2 CONFIGURATION ────────────────────────────────────────────────────
 
@@ -96,9 +127,7 @@ COMMON_PORTS = {
 # ─── STAGE 3 CONFIGURATION ────────────────────────────────────────────────────
 
 TIMEOUT_S3 = 3.0
-
 HTTP_PORTS = {80, 8080, 8443, 443}
-
 BINARY_PROTOCOL_PORTS = {53, 135, 139, 445, 3389}
 
 # ─── STAGE 4 CONFIGURATION ────────────────────────────────────────────────────
@@ -120,12 +149,6 @@ SKIP_BANNERS = {
     "HTTPS service (no Server header)",
 }
 
-# ─── AUTHORIZATION ────────────────────────────────────────────────────────────
-
-def is_authorized(network):
-    """Check if the target network is in our authorized list."""
-    return network in AUTHORIZED_NETWORKS
-
 
 # ─── STAGE 1: HOST DISCOVERY ──────────────────────────────────────────────────
 
@@ -133,15 +156,10 @@ def probe_host(ip):
     """
     Try to connect to a single host on multiple probe ports concurrently.
     If ANY port responds (success or refused), the host is alive.
-
-    threading.Event() acts as a flag — the first thread to find the host
-    alive sets it, and all other threads check it before connecting.
-    This prevents unnecessary work once we know the host is up.
     """
     found = threading.Event()
 
     def try_port(port):
-        # If another thread already found this host alive, don't bother
         if found.is_set():
             return
         try:
@@ -149,23 +167,17 @@ def probe_host(ip):
             sock.settimeout(TIMEOUT_S1)
             result = sock.connect_ex((str(ip), port))
             sock.close()
-
-            # 0 = connected
-            # 111 = connection refused on Linux (host is up, port is closed)
-            # 10061 = connection refused on Windows (same meaning)
             if result in (0, 111, 10061):
                 if not found.is_set():
                     found.set()
                     with lock:
                         live_hosts.append(str(ip))
                         print(f"  [+] Host UP: {ip} (port {port} responded)")
-
         except socket.timeout:
             pass
         except Exception:
             pass
 
-    # Launch one thread per probe port, all running simultaneously
     threads = []
     for port in PROBE_PORTS:
         t = threading.Thread(target=try_port, args=(port,))
@@ -173,7 +185,6 @@ def probe_host(ip):
         t.start()
         threads.append(t)
 
-    # Wait for all probe threads before moving to next host
     for t in threads:
         t.join()
 
@@ -209,10 +220,7 @@ def discover_hosts(network_range):
 # ─── STAGE 2: PORT SCANNER ────────────────────────────────────────────────────
 
 def scan_port(host, port, timeout=TIMEOUT_S2):
-    """
-    Attempt a TCP full connect to host:port and return its state.
-    Returns a tuple: (host, port, status)
-    """
+    """Attempt a TCP full connect to host:port and return its state."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
@@ -229,10 +237,7 @@ def scan_port(host, port, timeout=TIMEOUT_S2):
 
 def scan_host_ports(host, ports=COMMON_PORTS, timeout=TIMEOUT_S2,
                     max_workers=50):
-    """
-    Scan all target ports on a single host concurrently.
-    Returns a dict with open/closed/filtered port lists.
-    """
+    """Scan all target ports on a single host concurrently."""
     results = {
         "host":      host,
         "scan_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -268,10 +273,7 @@ def scan_host_ports(host, ports=COMMON_PORTS, timeout=TIMEOUT_S2,
 
 
 def run_port_scan(discovered_hosts, ports=COMMON_PORTS, host_workers=10):
-    """
-    Run port scans across all live hosts from Stage 1.
-    Returns a dict keyed by host IP.
-    """
+    """Run port scans across all live hosts from Stage 1."""
     total       = len(discovered_hosts)
     all_results = {}
 
@@ -304,16 +306,12 @@ def run_port_scan(discovered_hosts, ports=COMMON_PORTS, host_workers=10):
 # ─── STAGE 3: BANNER GRABBER ──────────────────────────────────────────────────
 
 def grab_banner(host, port, timeout=TIMEOUT_S3):
-    """
-    Attempt to retrieve a service banner from host:port.
-    Always returns a string — never None, never raises.
-    """
+    """Attempt to retrieve a service banner from host:port."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
             sock.connect((host, port))
 
-            # HTTPS — requires TLS wrap before sending
             if port in (443, 8443):
                 context = ssl.create_default_context()
                 context.check_hostname = False
@@ -331,7 +329,6 @@ def grab_banner(host, port, timeout=TIMEOUT_S3):
                 return first_line if first_line else \
                     "HTTPS service (no Server header)"
 
-            # Plain HTTP — send HEAD request to trigger response
             elif port in HTTP_PORTS:
                 sock.send(b"HEAD / HTTP/1.0\r\nHost: " +
                           host.encode() + b"\r\n\r\n")
@@ -343,7 +340,6 @@ def grab_banner(host, port, timeout=TIMEOUT_S3):
                 return first_line if first_line else \
                     "HTTP service (no Server header)"
 
-            # Binary protocol ports — quick recv, no waiting
             elif port in BINARY_PROTOCOL_PORTS:
                 sock.settimeout(1.0)
                 try:
@@ -354,7 +350,6 @@ def grab_banner(host, port, timeout=TIMEOUT_S3):
                     pass
                 return "No readable banner (binary protocol)"
 
-            # Passive ports — service speaks first (SSH, FTP, SMTP etc.)
             else:
                 banner_bytes = sock.recv(1024)
                 banner = banner_bytes.decode("utf-8",
@@ -408,10 +403,7 @@ def run_banner_grab(port_scan_results, timeout=TIMEOUT_S3):
 # ─── STAGE 5: CVE CORRELATOR ──────────────────────────────────────────────────
 
 def parse_banner_to_query(banner, service):
-    """
-    Extract a clean software name + version from a raw banner string.
-    Returns a search string like 'OpenSSH 10.2p1' or None.
-    """
+    """Extract a clean software name + version from a raw banner string."""
     if not banner or banner in SKIP_BANNERS:
         return None
 
@@ -457,10 +449,7 @@ def parse_banner_to_query(banner, service):
 
 
 def query_nvd(search_term):
-    """
-    Query the NVD API for CVEs matching a search term.
-    Returns a list of CVE dicts sorted by score descending.
-    """
+    """Query the NVD API for CVEs matching a search term."""
     params = urllib.parse.urlencode({
         "keywordSearch":  search_term,
         "resultsPerPage": MAX_CVES_PER_PORT
@@ -560,7 +549,7 @@ def correlate_host_cves(host, data):
 
 
 def run_cve_correlation(enriched_results):
-    """Run CVE correlation across all hosts. Adds 'cves' key to each host."""
+    """Run CVE correlation across all hosts."""
     print("\n[*] Starting CVE correlation")
     print("[*] Querying NVD API — this will take a moment (rate limited)")
     print("-" * 50)
@@ -626,7 +615,7 @@ def prepare_report_data(enriched_results, network_range):
     """Convert enriched_results into a clean JSON-serializable structure."""
     report = {
         "metadata": {
-            "tool":        "Network Scanner v0.5",
+            "tool":        "Network Scanner v0.6",
             "network":     network_range,
             "scan_date":   datetime.now().strftime("%Y-%m-%d"),
             "scan_time":   datetime.now().strftime("%H:%M:%S"),
@@ -696,7 +685,6 @@ def generate_html_report(report_data):
         open_ports     = data["open_ports"]
         filtered_ports = data["filtered_ports"]
 
-        # ── Open ports table ──────────────────────────────────────────────
         if open_ports:
             port_rows = ""
 
@@ -704,7 +692,6 @@ def generate_html_report(report_data):
                 banner_text  = p["banner"] if p["banner"] else "—"
                 banner_class = "banner-text" if p["banner"] else "no-banner"
 
-                # Build CVE rows if any exist for this port
                 cves     = p.get("cves", [])
                 cve_html = ""
                 if cves:
@@ -759,7 +746,6 @@ def generate_html_report(report_data):
         else:
             open_table = '<p class="no-findings">No open ports found</p>'
 
-        # ── Filtered ports ────────────────────────────────────────────────
         if filtered_ports:
             filtered_list = ", ".join(
                 f"{p['port']} ({p['service']})" for p in filtered_ports
@@ -769,7 +755,6 @@ def generate_html_report(report_data):
         else:
             filtered_section = ""
 
-        # ── Risk badge ────────────────────────────────────────────────────
         dangerous      = {21, 23, 445, 3389, 5900}
         open_port_nums = {p["port"] for p in open_ports}
         has_dangerous  = bool(dangerous & open_port_nums)
@@ -977,7 +962,7 @@ def generate_html_report(report_data):
     </div>
     {host_cards}
     <div class="footer">
-        Generated by Network Scanner v0.5 — AUTHORIZED USE ONLY
+        Generated by Network Scanner v0.6 — AUTHORIZED USE ONLY
     </div>
 </body>
 </html>"""
@@ -989,191 +974,12 @@ def generate_html_report(report_data):
     return filename
 
 
-# ─── STAGE 6: CLIENT PDF REPORT ──────────────────────────────────────────────
-
-# Risk scoring helpers
-DANGEROUS_PORTS = {
-    21:   ("FTP",    "Unencrypted file transfer — credentials sent in plaintext."),
-    23:   ("Telnet", "Unencrypted remote access — highly dangerous, replace with SSH."),
-    445:  ("SMB",    "Windows file sharing — common ransomware entry point."),
-    3389: ("RDP",    "Remote Desktop — brute-force target, should not be internet-facing."),
-    5900: ("VNC",    "Remote desktop — often misconfigured and exposed without auth."),
-    1433: ("MSSQL",  "Database port exposed — should never be internet-facing."),
-    3306: ("MySQL",  "Database port exposed — should never be internet-facing."),
-}
-
-RECOMMENDATIONS = {
-    21:   "Disable FTP. Use SFTP or SCP instead. If FTP is required, restrict to internal network only.",
-    23:   "Disable Telnet immediately. Replace with SSH (port 22) for all remote access.",
-    445:  "Restrict SMB to internal network only. Ensure Windows is fully patched (EternalBlue/MS17-010).",
-    3389: "Place RDP behind a VPN. Enable Network Level Authentication. Consider disabling if not needed.",
-    5900: "Disable VNC or place behind VPN. Ensure strong password is set if VNC must remain active.",
-    1433: "Firewall MSSQL port from external access. Use encrypted connections and strong sa password.",
-    3306: "Firewall MySQL port from external access. Use strong credentials and bind to localhost.",
-    22:   "Ensure SSH uses key-based authentication. Disable root login. Consider non-standard port.",
-    80:   "Redirect HTTP to HTTPS. Ensure web server software is fully patched.",
-    8080: "Non-standard HTTP port — verify this service is intentional and patch web server software.",
-    8443: "Verify this HTTPS service is intentional and using a valid certificate.",
-    25:   "Ensure SMTP relay is restricted. Open relays are exploited for spam campaigns.",
-}
-
-def _score_host(open_ports):
-    """
-    Calculate a simple risk score for a host based on its open ports.
-    Returns (score 0-100, label, color_hex).
-    Score weights: dangerous ports = 25pts each (cap 75), any open port = 10pts base.
-    CVEs found add additional weight.
-    """
-    if not open_ports:
-        return 5, "Minimal", "#3fb950"
-    score = 10  # base for having any open ports
-    port_nums = {p["port"] for p in open_ports}
-    dangerous_found = port_nums & set(DANGEROUS_PORTS.keys())
-    score += min(len(dangerous_found) * 25, 75)
-    # CVEs bump the score
-    for p in open_ports:
-        for cve in p.get("cves", []):
-            if cve["score"] >= 9.0:
-                score = min(score + 20, 100)
-            elif cve["score"] >= 7.0:
-                score = min(score + 10, 100)
-    score = min(score, 100)
-    if score >= 70:
-        return score, "High Risk", "#f85149"
-    elif score >= 40:
-        return score, "Medium Risk", "#d29922"
-    else:
-        return score, "Low Risk", "#3fb950"
-
-
-def _pdf_styles():
-    """Return a dict of named ParagraphStyles for the PDF report."""
-    N = colors.HexColor("#0f1f38")   # navy
-    A = colors.HexColor("#2d7dd2")   # accent blue
-    G = colors.HexColor("#c9a84c")   # gold
-    W = colors.white
-    T = colors.HexColor("#1a1a2e")   # dark text
-    M = colors.HexColor("#5a6a82")   # muted
-
-    def S(name, **kw):
-        return ParagraphStyle(name, **kw)
-
-    return {
-        "h1":      S("h1",  fontSize=20, textColor=N,  fontName="Helvetica-Bold",
-                     leading=26, spaceBefore=18, spaceAfter=6),
-        "h2":      S("h2",  fontSize=13, textColor=A,  fontName="Helvetica-Bold",
-                     leading=17, spaceBefore=14, spaceAfter=5),
-        "h3":      S("h3",  fontSize=11, textColor=N,  fontName="Helvetica-Bold",
-                     leading=15, spaceBefore=10, spaceAfter=4),
-        "body":    S("body",fontSize=10, textColor=T,  fontName="Helvetica",
-                     leading=15, spaceBefore=3,  spaceAfter=3),
-        "muted":   S("muted",fontSize=9, textColor=M,  fontName="Helvetica",
-                     leading=13, spaceBefore=2,  spaceAfter=2),
-        "mono":    S("mono",fontSize=9,  textColor=colors.HexColor("#2d7dd2"),
-                     fontName="Courier", leading=13),
-        "white_bold": S("wb",fontSize=10,textColor=W,  fontName="Helvetica-Bold",
-                        leading=14, alignment=TA_CENTER),
-        "white_sm":   S("ws",fontSize=8, textColor=colors.HexColor("#c8d8ea"),
-                        fontName="Helvetica", leading=12, alignment=TA_CENTER),
-        "th":      S("th",  fontSize=9,  textColor=W,  fontName="Helvetica-Bold",
-                     leading=13, alignment=TA_LEFT),
-        "td":      S("td",  fontSize=9,  textColor=T,  fontName="Helvetica",
-                     leading=13),
-        "td_mono": S("tdm", fontSize=9,  textColor=colors.HexColor("#2d7dd2"),
-                     fontName="Courier", leading=13),
-        "rec":     S("rec", fontSize=9,  textColor=colors.HexColor("#1a1a2e"),
-                     fontName="Helvetica", leading=13, leftIndent=8),
-        "cover_title": S("ct", fontSize=38, textColor=W, fontName="Helvetica-Bold",
-                         leading=44, alignment=TA_LEFT),
-        "cover_sub":   S("cs", fontSize=14, textColor=G, fontName="Helvetica",
-                         leading=20, alignment=TA_LEFT),
-        "cover_body":  S("cb", fontSize=10,
-                         textColor=colors.HexColor("#c8d8ea"),
-                         fontName="Helvetica", leading=16, alignment=TA_LEFT),
-        "disclaimer":  S("disc", fontSize=8, textColor=M, fontName="Helvetica-Oblique",
-                         leading=12, alignment=TA_CENTER),
-    }
-
-
-def _header_footer(canvas, doc):
-    """Page header and footer drawn on every page after the cover."""
-    if doc.page == 1:
-        _draw_cover_bg(canvas)
-        return
-    canvas.saveState()
-    w, h = letter
-    NAVY  = colors.HexColor("#0f1f38")
-    ACCENT= colors.HexColor("#2d7dd2")
-    GOLD  = colors.HexColor("#c9a84c")
-    WHITE = colors.white
-
-    # Header bar
-    canvas.setFillColor(NAVY)
-    canvas.rect(0, h - 32, w, 32, fill=1, stroke=0)
-    canvas.setFillColor(WHITE)
-    canvas.setFont("Helvetica-Bold", 8)
-    canvas.drawString(0.5*inch, h - 21, "NETWORK SECURITY AUDIT REPORT")
-    canvas.setFont("Helvetica", 8)
-    target = getattr(doc, "_scan_target", "")
-    canvas.drawRightString(w - 0.5*inch, h - 21,
-                           f"Target: {target}  |  CONFIDENTIAL")
-
-    # Footer
-    canvas.setFillColor(NAVY)
-    canvas.rect(0, 0, w, 24, fill=1, stroke=0)
-    canvas.setFillColor(GOLD)
-    canvas.rect(0, 0, w * 0.35, 3, fill=1, stroke=0)
-    canvas.setFillColor(WHITE)
-    canvas.setFont("Helvetica", 7)
-    canvas.drawString(0.5*inch, 8,
-                      "Generated by Network Scanner v0.5  |  AUTHORIZED USE ONLY")
-    canvas.setFont("Helvetica-Bold", 7)
-    canvas.drawRightString(w - 0.5*inch, 8, f"Page {doc.page}")
-    canvas.restoreState()
-
-
-def _draw_cover_bg(canvas):
-    """Draw the dark cover page background."""
-    w, h = letter
-    NAVY  = colors.HexColor("#0f1f38")
-    BLUE  = colors.HexColor("#1a3a6b")
-    GOLD  = colors.HexColor("#c9a84c")
-    ACCENT= colors.HexColor("#2d7dd2")
-    canvas.saveState()
-    canvas.setFillColor(NAVY)
-    canvas.rect(0, 0, w, h, fill=1, stroke=0)
-    # Decorative circles
-    canvas.setFillColor(BLUE)
-    canvas.circle(w - 0.8*inch, h - 0.8*inch, 2.4*inch, fill=1, stroke=0)
-    canvas.setFillColor(colors.HexColor("#0d1a2e"))
-    canvas.circle(w - 0.3*inch, h - 0.3*inch, 1.4*inch, fill=1, stroke=0)
-    # Accent lines
-    canvas.setFillColor(GOLD)
-    canvas.rect(0.5*inch, 1.6*inch, 0.05*inch, 5*inch, fill=1, stroke=0)
-    canvas.setFillColor(ACCENT)
-    canvas.rect(0, 0.5*inch, w * 0.5, 0.03*inch, fill=1, stroke=0)
-    canvas.setFillColor(GOLD)
-    canvas.rect(0, 0.5*inch, w * 0.2, 0.03*inch, fill=1, stroke=0)
-    # Footer strip
-    canvas.setFillColor(colors.HexColor("#0a1628"))
-    canvas.rect(0, 0, w, 0.5*inch, fill=1, stroke=0)
-    canvas.setFillColor(colors.HexColor("#8899aa"))
-    canvas.setFont("Helvetica", 7)
-    canvas.drawString(0.5*inch, 0.18*inch,
-                      "AUTHORIZED USE ONLY  |  Confidential")
-    canvas.restoreState()
-
-
 def generate_pdf_report(report_data, consultant_name="Your Name",
                         consultant_contact="your@email.com"):
-    """
-    Stage 6: Generate a client-facing PDF audit report from report_data.
-    report_data is the dict produced by prepare_report_data().
-    Returns the Path of the saved PDF file.
-    """
+    """Generate a professional client-facing PDF audit report."""
     if not REPORTLAB_AVAILABLE:
-        print("  [!] reportlab not installed — skipping PDF report.")
-        print("  [!] Install with: pip install reportlab")
+        print("  [!] reportlab not installed — skipping PDF report")
+        print("  [!] Install with: pip install reportlab --break-system-packages")
         return None
 
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1182,471 +988,413 @@ def generate_pdf_report(report_data, consultant_name="Your Name",
 
     meta  = report_data["metadata"]
     hosts = report_data["hosts"]
-    ST    = _pdf_styles()
 
-    NAVY   = colors.HexColor("#0f1f38")
-    ACCENT = colors.HexColor("#2d7dd2")
-    GOLD   = colors.HexColor("#c9a84c")
-    RED    = colors.HexColor("#f85149")
-    YELLOW = colors.HexColor("#d29922")
-    GREEN  = colors.HexColor("#3fb950")
-    WHITE  = colors.white
-    LIGHT  = colors.HexColor("#e8f1fb")
-    BORDER = colors.HexColor("#d0dce9")
-    BG_ROW = colors.HexColor("#f4f7fc")
+    # ── Styles ────────────────────────────────────────────────────────────────
+    DARK    = HexColor("#1a1a2a")
+    BLUE    = HexColor("#1a6fbd")
+    GREEN   = HexColor("#1a7a34")
+    RED     = HexColor("#b01020")
+    ORANGE  = HexColor("#8a5a00")
+    MUTED   = HexColor("#555566")
+    LIGHT   = HexColor("#f4f6f9")
+    BORDER  = HexColor("#c0c4d0")
+    HEAD_BG = HexColor("#2a2a3a")
+
+    ST = {
+        "title": ParagraphStyle("title",
+            fontSize=28, fontName="Helvetica-Bold",
+            textColor=BLUE, spaceAfter=6),
+        "subtitle": ParagraphStyle("subtitle",
+            fontSize=12, fontName="Helvetica",
+            textColor=MUTED, spaceAfter=4),
+        "h1": ParagraphStyle("h1",
+            fontSize=14, fontName="Helvetica-Bold",
+            textColor=BLUE, spaceBefore=16, spaceAfter=6),
+        "h2": ParagraphStyle("h2",
+            fontSize=11, fontName="Helvetica-Bold",
+            textColor=GREEN, spaceBefore=10, spaceAfter=4),
+        "body": ParagraphStyle("body",
+            fontSize=10, fontName="Helvetica",
+            textColor=DARK, spaceAfter=6, leading=15),
+        "mono": ParagraphStyle("mono",
+            fontSize=9, fontName="Courier",
+            textColor=HexColor("#1a4a1a"), spaceAfter=3),
+        "warn": ParagraphStyle("warn",
+            fontSize=10, fontName="Helvetica-Bold",
+            textColor=RED, spaceAfter=4),
+        "disclaimer": ParagraphStyle("disclaimer",
+            fontSize=8, fontName="Helvetica",
+            textColor=MUTED, spaceAfter=4, leading=12),
+        "footer": ParagraphStyle("footer",
+            fontSize=8, fontName="Helvetica",
+            textColor=MUTED, alignment=TA_CENTER),
+        "right": ParagraphStyle("right",
+            fontSize=8, fontName="Helvetica",
+            textColor=MUTED, alignment=TA_RIGHT),
+    }
+
+    def table_style(col_widths=None):
+        return TableStyle([
+            ("BACKGROUND",    (0,0), (-1,0),  HEAD_BG),
+            ("TEXTCOLOR",     (0,0), (-1,0),  colors.white),
+            ("FONTNAME",      (0,0), (-1,0),  "Helvetica-Bold"),
+            ("FONTSIZE",      (0,0), (-1,-1), 9),
+            ("FONTNAME",      (0,1), (-1,-1), "Helvetica"),
+            ("TEXTCOLOR",     (0,1), (-1,-1), DARK),
+            ("ROWBACKGROUNDS",(0,1), (-1,-1),
+             [LIGHT, HexColor("#eaecf2")]),
+            ("GRID",          (0,0), (-1,-1), 0.4, BORDER),
+            ("TOPPADDING",    (0,0), (-1,-1), 6),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 6),
+            ("LEFTPADDING",   (0,0), (-1,-1), 8),
+            ("RIGHTPADDING",  (0,0), (-1,-1), 8),
+            ("VALIGN",        (0,0), (-1,-1), "TOP"),
+        ])
+
+    def _header_footer(canvas, doc):
+        canvas.saveState()
+        w, h = letter
+        canvas.setFont("Helvetica-Bold", 8)
+        canvas.setFillColor(MUTED)
+        canvas.drawString(0.85*inch, h - 0.55*inch,
+                          "AUTHORIZED USE ONLY | Confidential")
+        canvas.drawRightString(w - 0.85*inch, h - 0.55*inch,
+                               f"Network Security Audit Report  "
+                               f"Target: {meta['network']}")
+        canvas.setLineWidth(0.5)
+        canvas.setStrokeColor(BORDER)
+        canvas.line(0.85*inch, h - 0.65*inch,
+                    w - 0.85*inch, h - 0.65*inch)
+        if doc.page > 1:
+            canvas.drawCentredString(w/2, 0.5*inch,
+                f"Generated by Network Scanner v0.6 | "
+                f"AUTHORIZED USE ONLY    "
+                f"Page {doc.page}")
+            canvas.line(0.85*inch, 0.65*inch,
+                        w - 0.85*inch, 0.65*inch)
+        canvas.restoreState()
 
     doc = SimpleDocTemplate(
         str(filename), pagesize=letter,
-        leftMargin=0.65*inch, rightMargin=0.65*inch,
-        topMargin=0.55*inch,  bottomMargin=0.45*inch,
+        leftMargin=0.85*inch, rightMargin=0.85*inch,
+        topMargin=1.0*inch,   bottomMargin=0.85*inch,
     )
-    doc._scan_target = meta.get("network", "")
 
     story = []
 
-    # ── COVER ──────────────────────────────────────────────────────────────
-    story.append(Spacer(1, 1.5*inch))
-    story.append(Paragraph("Network Security", ST["cover_sub"]))
-    story.append(Paragraph("Audit Report", ST["cover_title"]))
-    story.append(Spacer(1, 0.15*inch))
-    story.append(Paragraph(f"Target Network: {meta['network']}", ST["cover_sub"]))
-    story.append(Spacer(1, 0.25*inch))
-    story.append(HRFlowable(width="100%", thickness=0.8,
-                             color=colors.HexColor("#2d4a6b"), spaceAfter=16))
+    # ── Cover ─────────────────────────────────────────────────────────────────
+    story.append(Spacer(1, 0.3*inch))
+    story.append(Paragraph("Network Security", ST["title"]))
+    story.append(Paragraph("Audit Report", ST["title"]))
+    story.append(Spacer(1, 0.1*inch))
     story.append(Paragraph(
-        f"Scan Date: {meta['scan_date']}  &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"Hosts Assessed: {meta['total_hosts']}  &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"Target Network: {meta['network']}", ST["subtitle"]))
+    story.append(Paragraph(
+        f"Scan Date: {meta['scan_date']}  |  "
+        f"Hosts Assessed: {meta['total_hosts']}  |  "
         f"Open Ports Found: {meta['total_open_ports']}",
-        ST["cover_body"]))
-    story.append(Spacer(1, 0.5*inch))
+        ST["subtitle"]))
+    story.append(Spacer(1, 0.2*inch))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=BLUE))
+    story.append(Spacer(1, 0.2*inch))
 
-    # Cover stat cards
-    all_open = []
-    for h_data in hosts.values():
-        all_open.extend(h_data.get("open_ports", []))
-    all_cves = [c for p in all_open for c in p.get("cves", [])]
-    critical_cves = sum(1 for c in all_cves if c["score"] >= 9.0)
-    high_cves     = sum(1 for c in all_cves if 7.0 <= c["score"] < 9.0)
-    dangerous_exposed = sum(
+    # Summary stats
+    total_dangerous = sum(
         1 for h in hosts.values()
-        for p in h.get("open_ports", [])
-        if p["port"] in DANGEROUS_PORTS
+        for p in h["open_ports"]
+        if p["port"] in {21, 23, 445, 3389, 5900, 1433, 3306}
+    )
+    total_cves = sum(
+        len(p.get("cves", []))
+        for h in hosts.values()
+        for p in h["open_ports"]
+    )
+    critical_cves = sum(
+        1 for h in hosts.values()
+        for p in h["open_ports"]
+        for cve in p.get("cves", [])
+        if cve.get("score", 0) >= 9.0
     )
 
-    def stat_cell(val, label):
-        return [Paragraph(str(val), ST["white_bold"]),
-                Paragraph(label,    ST["white_sm"])]
-
-    stat_data = [[stat_cell(meta["total_hosts"],  "Hosts\nFound"),
-                  stat_cell(meta["total_open_ports"], "Open\nPorts"),
-                  stat_cell(dangerous_exposed,    "Dangerous\nServices"),
-                  stat_cell(len(all_cves),        "CVEs\nFound"),
-                  stat_cell(critical_cves,        "Critical\nCVEs")]]
-
-    stat_table = Table(stat_data,
-                       colWidths=[1.36*inch]*5)
-    stat_table.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0),(-1,-1), colors.HexColor("#1a3a6b")),
-        ("TOPPADDING",    (0,0),(-1,-1), 12),
-        ("BOTTOMPADDING", (0,0),(-1,-1), 10),
-        ("LINEAFTER",     (0,0),(3,-1),  0.5, colors.HexColor("#2d5080")),
-        ("BOX",           (0,0),(-1,-1), 0.5, colors.HexColor("#2d5080")),
-        ("BACKGROUND",    (4,0),(4,-1),
-         colors.HexColor("#3d1a1a") if critical_cves > 0
-         else colors.HexColor("#1a3a6b")),
-        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+    stats_data = [[
+        Paragraph(f"<b>{meta['total_hosts']}</b><br/>Hosts Found",
+                  ST["body"]),
+        Paragraph(f"<b>{meta['total_open_ports']}</b><br/>Open Ports",
+                  ST["body"]),
+        Paragraph(f"<b>{total_dangerous}</b><br/>Dangerous Services",
+                  ST["body"]),
+        Paragraph(f"<b>{total_cves}</b><br/>CVEs Found", ST["body"]),
+        Paragraph(f"<b>{critical_cves}</b><br/>Critical CVEs", ST["body"]),
+    ]]
+    stats_tbl = Table(stats_data,
+                      colWidths=[1.26*inch]*5)
+    stats_tbl.setStyle(TableStyle([
+        ("ALIGN",         (0,0), (-1,-1), "CENTER"),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ("BOX",           (0,0), (-1,-1), 1,   BORDER),
+        ("INNERGRID",     (0,0), (-1,-1), 0.5, BORDER),
+        ("BACKGROUND",    (0,0), (-1,-1), LIGHT),
+        ("TOPPADDING",    (0,0), (-1,-1), 10),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
     ]))
-    story.append(stat_table)
-    story.append(Spacer(1, 0.35*inch))
+    story.append(stats_tbl)
+    story.append(Spacer(1, 0.3*inch))
     story.append(Paragraph(
-        f"Prepared by: {consultant_name}  &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"{consultant_contact}",
-        ST["cover_body"]))
+        f"Prepared by: {consultant_name} | {consultant_contact}",
+        ST["disclaimer"]))
+
     story.append(PageBreak())
 
-    # ── EXECUTIVE SUMMARY ──────────────────────────────────────────────────
+    # ── Executive Summary ─────────────────────────────────────────────────────
     story.append(Paragraph("Executive Summary", ST["h1"]))
-    story.append(HRFlowable(width="100%", thickness=1.5,
-                             color=ACCENT, spaceAfter=8))
 
-    # Overall risk determination
-    high_risk_hosts   = []
-    medium_risk_hosts = []
-    for ip, h_data in hosts.items():
-        score, label, _ = _score_host(h_data.get("open_ports", []))
-        if label == "High Risk":
-            high_risk_hosts.append(ip)
-        elif label == "Medium Risk":
-            medium_risk_hosts.append(ip)
+    overall_risk = ("HIGH"   if total_dangerous >= 3 else
+                    "MEDIUM" if total_dangerous >= 1 else "LOW")
+    risk_color   = (RED if overall_risk == "HIGH" else
+                    HexColor("#8a5a00") if overall_risk == "MEDIUM"
+                    else GREEN)
 
-    if high_risk_hosts:
-        overall = "HIGH"
-        overall_color = RED
+    risk_data = [[
+        Paragraph("OVERALL RISK RATING", ST["body"]),
+        Paragraph(f"<b>{overall_risk}</b>",
+                  ParagraphStyle("risk", fontSize=12,
+                                 fontName="Helvetica-Bold",
+                                 textColor=risk_color))
+    ]]
+    risk_tbl = Table(risk_data, colWidths=[4.5*inch, 1.8*inch])
+    risk_tbl.setStyle(TableStyle([
+        ("BOX",           (0,0), (-1,-1), 1,   BORDER),
+        ("BACKGROUND",    (0,0), (-1,-1), LIGHT),
+        ("TOPPADDING",    (0,0), (-1,-1), 10),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
+        ("LEFTPADDING",   (0,0), (-1,-1), 12),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+    ]))
+    story.append(risk_tbl)
+    story.append(Spacer(1, 0.1*inch))
+
+    if overall_risk == "HIGH":
         summary_text = (
-            f"This assessment identified <b>{len(high_risk_hosts)} high-risk "
-            f"host(s)</b> on the {meta['network']} network. Dangerous services "
-            f"are exposed that could allow an attacker to gain unauthorized access, "
-            f"exfiltrate data, or deploy ransomware. Immediate action is recommended "
-            f"on the findings marked Critical and High in this report."
-        )
-    elif medium_risk_hosts:
-        overall = "MEDIUM"
-        overall_color = YELLOW
+            f"This assessment identified {meta['total_hosts']} host(s) on "
+            f"the {meta['network']} network with critical security concerns "
+            f"requiring immediate attention. High-risk services are exposed "
+            f"that present significant exploitation risk.")
+    elif overall_risk == "MEDIUM":
         summary_text = (
-            f"This assessment identified {meta['total_hosts']} host(s) on the "
-            f"{meta['network']} network with open ports requiring review. No "
-            f"critically dangerous services were detected, but several findings "
-            f"increase the attack surface and should be addressed within 30 days."
-        )
+            f"This assessment identified {meta['total_hosts']} host(s) on "
+            f"the {meta['network']} network with open ports requiring review. "
+            f"No critically dangerous services were detected, but several "
+            f"findings increase the attack surface and should be addressed "
+            f"within 30 days.")
     else:
-        overall = "LOW"
-        overall_color = GREEN
         summary_text = (
             f"This assessment found {meta['total_hosts']} host(s) on the "
             f"{meta['network']} network. No high-risk services were detected. "
             f"The network presents a minimal external attack surface based on "
-            f"the ports and services observed during this scan."
-        )
+            f"the ports and services observed during this scan.")
 
-    risk_row = [[
-        Paragraph("OVERALL RISK RATING", ST["white_bold"]),
-        Paragraph(overall, ParagraphStyle(
-            "risk_val", fontSize=22, textColor=overall_color,
-            fontName="Helvetica-Bold", leading=26, alignment=TA_CENTER)),
-    ]]
-    risk_t = Table(risk_row, colWidths=[2.5*inch, 4.7*inch])
-    risk_t.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0),(0,-1), NAVY),
-        ("BACKGROUND",    (1,0),(1,-1), colors.HexColor("#1c2535")),
-        ("TOPPADDING",    (0,0),(-1,-1), 14),
-        ("BOTTOMPADDING", (0,0),(-1,-1), 14),
-        ("LEFTPADDING",   (0,0),(-1,-1), 14),
-        ("BOX",           (0,0),(-1,-1), 0.5, BORDER),
-        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
-    ]))
-    story.append(risk_t)
-    story.append(Spacer(1, 0.12*inch))
     story.append(Paragraph(summary_text, ST["body"]))
-    story.append(Spacer(1, 0.18*inch))
 
-    # Key findings bullets
     story.append(Paragraph("Key Findings", ST["h2"]))
-    if dangerous_exposed > 0:
+    if total_dangerous > 0:
         story.append(Paragraph(
-            f"&#8226; <b>{dangerous_exposed} dangerous service(s)</b> detected "
+            f"• {total_dangerous} dangerous service(s) detected "
             f"(FTP, Telnet, RDP, SMB, VNC, or exposed databases). "
-            f"These are the highest-priority items to address.", ST["body"]))
-    if len(all_cves) > 0:
-        story.append(Paragraph(
-            f"&#8226; <b>{len(all_cves)} CVE(s)</b> correlated across open services "
-            f"({critical_cves} Critical, {high_cves} High). "
-            f"Review CVE details in the findings section.", ST["body"]))
-    if meta["total_open_ports"] > 0:
-        story.append(Paragraph(
-            f"&#8226; <b>{meta['total_open_ports']} open port(s)</b> found across "
-            f"{meta['total_hosts']} host(s). Each open port is a potential entry "
-            f"point — close or restrict any that are not actively needed.",
+            f"These are the highest-priority items to address.",
             ST["body"]))
+    story.append(Paragraph(
+        f"• {meta['total_open_ports']} open port(s) found across "
+        f"{meta['total_hosts']} host(s). Each open port is a potential "
+        f"entry point — close or restrict any that are not actively needed.",
+        ST["body"]))
 
-    # Remediation priority box
-    story.append(Spacer(1, 0.1*inch))
-    prio_data = [[
-        Paragraph("Priority", ST["th"]),
-        Paragraph("Action", ST["th"]),
-        Paragraph("Timeframe", ST["th"]),
-    ]]
-    if high_risk_hosts:
-        prio_data.append([
-            Paragraph("CRITICAL", ParagraphStyle("crit", fontSize=9,
-                textColor=RED, fontName="Helvetica-Bold", leading=13)),
-            Paragraph("Restrict or disable dangerous services on high-risk hosts", ST["td"]),
-            Paragraph("24–48 hours", ST["td"]),
+    story.append(Paragraph("Remediation Priorities", ST["h2"]))
+    remed_data = [["Priority", "Action", "Timeframe"]]
+    if total_dangerous > 0:
+        remed_data.append([
+            "HIGH",
+            "Immediately review dangerous services — RDP, SMB, Telnet, "
+            "FTP, VNC, exposed databases",
+            "7 days"
         ])
-    if len(all_cves) > 0:
-        prio_data.append([
-            Paragraph("HIGH", ParagraphStyle("high", fontSize=9,
-                textColor=YELLOW, fontName="Helvetica-Bold", leading=13)),
-            Paragraph("Patch software with known CVEs — prioritize Critical/High scores", ST["td"]),
-            Paragraph("1–2 weeks", ST["td"]),
-        ])
-    prio_data.append([
-        Paragraph("MEDIUM", ParagraphStyle("med", fontSize=9,
-            textColor=GREEN, fontName="Helvetica-Bold", leading=13)),
-        Paragraph("Review all open ports — close anything not actively required", ST["td"]),
-        Paragraph("30 days", ST["td"]),
+    remed_data.append([
+        "MEDIUM",
+        "Review all open ports — close anything not actively required",
+        "30 days"
     ])
-    prio_t = Table(prio_data, colWidths=[1.1*inch, 4.5*inch, 1.6*inch])
-    prio_t.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0),(-1,0),  NAVY),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, BG_ROW]),
-        ("TOPPADDING",    (0,0),(-1,-1), 7),
-        ("BOTTOMPADDING", (0,0),(-1,-1), 7),
-        ("LEFTPADDING",   (0,0),(-1,-1), 10),
-        ("RIGHTPADDING",  (0,0),(-1,-1), 10),
-        ("GRID",          (0,0),(-1,-1), 0.4, BORDER),
-        ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
-    ]))
-    story.append(KeepTogether([
-        Paragraph("Remediation Priorities", ST["h2"]),
-        prio_t
-    ]))
+    rt = Table(remed_data, colWidths=[0.9*inch, 4.0*inch, 1.4*inch])
+    rt.setStyle(table_style())
+    story.append(rt)
+
     story.append(PageBreak())
 
-    # ── HOST-BY-HOST FINDINGS ──────────────────────────────────────────────
+    # ── Detailed Findings ─────────────────────────────────────────────────────
     story.append(Paragraph("Detailed Findings", ST["h1"]))
-    story.append(HRFlowable(width="100%", thickness=1.5,
-                             color=ACCENT, spaceAfter=8))
     story.append(Paragraph(
         "The following section details findings for each host discovered "
         "during the scan. Dangerous services are highlighted in red. "
         "CVE details are included where version information was available.",
         ST["body"]))
-    story.append(Spacer(1, 0.15*inch))
 
-    for ip in sorted(hosts.keys(),
-                     key=lambda x: ipaddress.ip_address(x)):
-        h_data     = hosts[ip]
-        open_ports = h_data.get("open_ports", [])
-        score, risk_label, risk_color = _score_host(open_ports)
+    DANGEROUS_PORTS = {21, 23, 445, 3389, 5900, 1433, 3306}
+    PORT_RECS = {
+        21:   "Disable FTP if possible. Use SFTP instead. "
+              "Check for anonymous login.",
+        23:   "Disable Telnet immediately — credentials sent in plaintext. "
+              "Use SSH.",
+        445:  "Restrict SMB to internal network only. "
+              "Ensure Windows is fully patched (EternalBlue/MS17-010).",
+        3389: "Place RDP behind a VPN. Enable Network Level Authentication. "
+              "Consider disabling if not needed.",
+        5900: "Disable VNC or add strong authentication. "
+              "Never expose to internet.",
+        1433: "Restrict MSSQL access to application servers only. "
+              "Disable SA account if possible.",
+        3306: "Bind MySQL to localhost only. "
+              "Remove anonymous accounts.",
+    }
 
-        # Host header card
-        host_header = [[
-            Paragraph(ip, ParagraphStyle(
-                "ip", fontSize=14, textColor=WHITE,
-                fontName="Helvetica-Bold", leading=18)),
-            Paragraph(
-                f"Scanned: {h_data.get('scan_time','')}<br/>"
-                f"{len(open_ports)} open port(s)",
-                ParagraphStyle("hm", fontSize=8,
-                    textColor=colors.HexColor("#8899cc"),
-                    fontName="Helvetica", leading=12)),
-            Paragraph(risk_label, ParagraphStyle(
-                "rl", fontSize=10, fontName="Helvetica-Bold",
-                textColor=colors.HexColor(risk_color)
-                if isinstance(risk_color, str) else risk_color,
-                leading=14, alignment=TA_RIGHT)),
+    for host_ip, host_data in sorted(
+            hosts.items(),
+            key=lambda x: ipaddress.ip_address(x[0])):
+
+        open_ports     = host_data["open_ports"]
+        dangerous_here = [p for p in open_ports
+                          if p["port"] in DANGEROUS_PORTS]
+
+        host_risk = ("High Risk"   if dangerous_here else
+                     "Medium Risk" if open_ports else "Low Risk")
+        host_risk_color = (RED    if dangerous_here else
+                           ORANGE if open_ports else GREEN)
+
+        story.append(Spacer(1, 0.1*inch))
+
+        header_data = [[
+            Paragraph(f"<b>{host_ip}</b>  "
+                      f"Scanned: {host_data['scan_time']}", ST["body"]),
+            Paragraph(f"{len(open_ports)} open port(s)",  ST["body"]),
+            Paragraph(f"<b>{host_risk}</b>",
+                      ParagraphStyle("hr", fontSize=9,
+                                     fontName="Helvetica-Bold",
+                                     textColor=host_risk_color))
         ]]
-        host_t = Table(host_header, colWidths=[2.2*inch, 3.5*inch, 1.5*inch])
-        host_t.setStyle(TableStyle([
-            ("BACKGROUND",    (0,0),(-1,-1), NAVY),
-            ("TOPPADDING",    (0,0),(-1,-1), 10),
-            ("BOTTOMPADDING", (0,0),(-1,-1), 10),
-            ("LEFTPADDING",   (0,0),(-1,-1), 12),
-            ("RIGHTPADDING",  (0,0),(-1,-1), 12),
-            ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
-            ("LINEBELOW",     (0,0),(-1,-1), 2,
-             colors.HexColor(risk_color)
-             if isinstance(risk_color, str) else risk_color),
+        ht = Table(header_data,
+                   colWidths=[3.2*inch, 1.5*inch, 1.6*inch])
+        ht.setStyle(TableStyle([
+            ("BACKGROUND",    (0,0), (-1,-1), LIGHT),
+            ("BOX",           (0,0), (-1,-1), 0.5, BORDER),
+            ("TOPPADDING",    (0,0), (-1,-1), 7),
+            ("BOTTOMPADDING", (0,0), (-1,-1), 7),
+            ("LEFTPADDING",   (0,0), (-1,-1), 10),
+            ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
         ]))
-        story.append(host_t)
+        story.append(ht)
 
-        if not open_ports:
-            story.append(Paragraph(
-                "No open ports detected on this host during the scan.",
-                ST["muted"]))
-            story.append(Spacer(1, 0.15*inch))
-            continue
-
-        # Ports table
-        port_rows = [[
-            Paragraph("Port", ST["th"]),
-            Paragraph("Service", ST["th"]),
-            Paragraph("Banner / Version", ST["th"]),
-            Paragraph("Risk", ST["th"]),
-        ]]
-        for p in open_ports:
-            port_num = p["port"]
-            is_dangerous = port_num in DANGEROUS_PORTS
-            risk_cell = Paragraph(
-                "⚠ Dangerous" if is_dangerous else "Review",
-                ParagraphStyle("rc", fontSize=8,
-                    textColor=RED if is_dangerous else YELLOW,
-                    fontName="Helvetica-Bold", leading=12)
-            ) if open_ports else Paragraph("—", ST["td"])
-
-            banner = p.get("banner", "") or "—"
-            port_rows.append([
-                Paragraph(str(port_num), ST["td_mono"]),
-                Paragraph(p.get("service", ""), ST["td"]),
-                Paragraph(banner[:60] + ("..." if len(banner) > 60 else ""),
-                          ST["td_mono"]),
-                risk_cell,
-            ])
-
-        ports_t = Table(port_rows,
-                        colWidths=[0.7*inch, 1.1*inch, 3.8*inch, 1.1*inch])
-        ports_t.setStyle(TableStyle([
-            ("BACKGROUND",    (0,0),(-1,0),  colors.HexColor("#1c2535")),
-            ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, BG_ROW]),
-            ("TOPPADDING",    (0,0),(-1,-1), 6),
-            ("BOTTOMPADDING", (0,0),(-1,-1), 6),
-            ("LEFTPADDING",   (0,0),(-1,-1), 8),
-            ("RIGHTPADDING",  (0,0),(-1,-1), 8),
-            ("GRID",          (0,0),(-1,-1), 0.4, BORDER),
-            ("VALIGN",        (0,0),(-1,-1), "TOP"),
-        ]))
-        story.append(ports_t)
-
-        # Recommendations for dangerous ports on this host
-        recs = []
-        for p in open_ports:
-            if p["port"] in RECOMMENDATIONS:
-                recs.append((p["port"], p["service"],
-                             RECOMMENDATIONS[p["port"]]))
-        if recs:
-            rec_rows = [[
-                Paragraph("Port", ST["th"]),
-                Paragraph("Recommendation", ST["th"]),
-            ]]
-            for port_num, service, rec_text in recs:
-                rec_rows.append([
-                    Paragraph(f"{port_num}\n({service})",
-                              ParagraphStyle("recport", fontSize=9,
-                                  textColor=ACCENT, fontName="Courier",
-                                  leading=13, alignment=TA_CENTER)),
-                    Paragraph(rec_text, ST["rec"]),
+        if open_ports:
+            port_rows = [["Port", "Service", "Banner / Version", "Risk"]]
+            for p in open_ports:
+                is_dangerous = p["port"] in DANGEROUS_PORTS
+                risk_label   = "Dangerous" if is_dangerous else "Review"
+                risk_col     = (RED if is_dangerous else ORANGE)
+                banner       = (p["banner"] if p["banner"] else
+                                "No banner retrieved")
+                port_rows.append([
+                    str(p["port"]),
+                    p["service"],
+                    banner[:60],
+                    Paragraph(f"<b>{'■ ' if is_dangerous else ''}"
+                              f"{risk_label}</b>",
+                              ParagraphStyle("rl", fontSize=8,
+                                             fontName="Helvetica-Bold",
+                                             textColor=risk_col))
                 ])
-            rec_t = Table(rec_rows, colWidths=[0.9*inch, 6.3*inch])
-            rec_t.setStyle(TableStyle([
-                ("BACKGROUND",    (0,0),(-1,0),  colors.HexColor("#1f2d1f")),
-                ("ROWBACKGROUNDS",(0,1),(-1,-1), [colors.HexColor("#f0f7f0"),
-                                                   WHITE]),
-                ("TOPPADDING",    (0,0),(-1,-1), 6),
-                ("BOTTOMPADDING", (0,0),(-1,-1), 6),
-                ("LEFTPADDING",   (0,0),(-1,-1), 8),
-                ("RIGHTPADDING",  (0,0),(-1,-1), 8),
-                ("GRID",          (0,0),(-1,-1), 0.4, BORDER),
-                ("VALIGN",        (0,0),(-1,-1), "TOP"),
-                ("LINEBEFORE",    (0,0),(0,-1),  3, GREEN),
-            ]))
-            story.append(KeepTogether([
-                Spacer(1, 0.06*inch),
-                Paragraph("Recommendations", ST["h3"]),
-                rec_t,
-            ]))
 
-        # CVEs for this host
-        host_cves = [
-            (p["port"], p["service"], c)
-            for p in open_ports
-            for c in p.get("cves", [])
-        ]
-        if host_cves:
-            cve_rows = [[
-                Paragraph("CVE ID", ST["th"]),
-                Paragraph("Port", ST["th"]),
-                Paragraph("CVSS", ST["th"]),
-                Paragraph("Severity", ST["th"]),
-                Paragraph("Description", ST["th"]),
-            ]]
-            for port_num, service, cve in sorted(
-                    host_cves, key=lambda x: x[2]["score"], reverse=True):
-                s = cve["score"]
-                if s >= 9.0:
-                    sev_color = RED
-                elif s >= 7.0:
-                    sev_color = YELLOW
-                elif s >= 4.0:
-                    sev_color = GREEN
-                else:
-                    sev_color = colors.HexColor("#8b949e")
+            pt = Table(port_rows,
+                       colWidths=[0.6*inch, 0.9*inch, 3.8*inch, 1.0*inch])
+            pt.setStyle(table_style())
+            story.append(pt)
 
-                cve_rows.append([
-                    Paragraph(cve["id"], ParagraphStyle(
-                        "cveid", fontSize=8, textColor=ACCENT,
-                        fontName="Courier", leading=12)),
-                    Paragraph(f"{port_num}\n({service})",
-                              ParagraphStyle("cveport", fontSize=8,
-                                  textColor=colors.HexColor("#5a6a82"),
-                                  fontName="Courier", leading=12,
-                                  alignment=TA_CENTER)),
-                    Paragraph(str(s), ParagraphStyle(
-                        "cvss", fontSize=10, textColor=sev_color,
-                        fontName="Helvetica-Bold", leading=14,
-                        alignment=TA_CENTER)),
-                    Paragraph(cve["severity"], ParagraphStyle(
-                        "sev", fontSize=8, textColor=sev_color,
-                        fontName="Helvetica-Bold", leading=12,
-                        alignment=TA_CENTER)),
-                    Paragraph(cve["description"][:120] + (
-                        "..." if len(cve["description"]) > 120 else ""),
-                        ST["muted"]),
-                ])
-            cve_t = Table(cve_rows,
-                          colWidths=[1.3*inch, 0.75*inch, 0.6*inch,
-                                     0.75*inch, 3.8*inch])
-            cve_t.setStyle(TableStyle([
-                ("BACKGROUND",    (0,0),(-1,0),  colors.HexColor("#1c1a2e")),
-                ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, colors.HexColor("#f7f4fc")]),
-                ("TOPPADDING",    (0,0),(-1,-1), 6),
-                ("BOTTOMPADDING", (0,0),(-1,-1), 6),
-                ("LEFTPADDING",   (0,0),(-1,-1), 8),
-                ("RIGHTPADDING",  (0,0),(-1,-1), 8),
-                ("GRID",          (0,0),(-1,-1), 0.4, BORDER),
-                ("VALIGN",        (0,0),(-1,-1), "TOP"),
-                ("LINEBEFORE",    (0,0),(0,-1),  3,
-                 colors.HexColor("#8b5cf6")),
-            ]))
-            story.append(KeepTogether([
-                Spacer(1, 0.06*inch),
-                Paragraph("CVE Correlations", ST["h3"]),
-                cve_t,
-            ]))
+            # CVE findings
+            for p in open_ports:
+                if p.get("cves"):
+                    story.append(Paragraph(
+                        f"CVEs — Port {p['port']} ({p['service']})",
+                        ST["h2"]))
+                    cve_rows = [["CVE ID", "CVSS", "Severity",
+                                 "Description"]]
+                    for cve in p["cves"]:
+                        score = cve.get("score", 0)
+                        sev   = cve.get("severity", "Unknown")
+                        sev_color = (RED    if score >= 9.0 else
+                                     ORANGE if score >= 7.0 else
+                                     GREEN  if score >= 4.0 else MUTED)
+                        cve_rows.append([
+                            cve["id"],
+                            str(score),
+                            Paragraph(f"<b>{sev}</b>",
+                                      ParagraphStyle("sc", fontSize=8,
+                                                     fontName="Helvetica-Bold",
+                                                     textColor=sev_color)),
+                            cve.get("description", "")[:80]
+                        ])
+                    ct = Table(cve_rows,
+                               colWidths=[1.4*inch, 0.6*inch,
+                                          0.9*inch, 3.4*inch])
+                    ct.setStyle(table_style())
+                    story.append(ct)
 
-        story.append(Spacer(1, 0.25*inch))
+            # Recommendations
+            recs = [(p["port"], PORT_RECS[p["port"]])
+                    for p in open_ports if p["port"] in PORT_RECS]
+            if recs:
+                story.append(Paragraph("Recommendations", ST["h2"]))
+                rec_rows = [["Port", "Recommendation"]]
+                for port, rec in recs:
+                    svc = next((p["service"] for p in open_ports
+                                if p["port"] == port), "")
+                    rec_rows.append([f"{port} ({svc})", rec])
+                rect = Table(rec_rows,
+                             colWidths=[1.2*inch, 5.1*inch])
+                rect.setStyle(table_style())
+                story.append(rect)
 
-    # ── APPENDIX: SCOPE & METHODOLOGY ─────────────────────────────────────
+        story.append(Spacer(1, 0.15*inch))
+
     story.append(PageBreak())
-    story.append(Paragraph("Scope &amp; Methodology", ST["h1"]))
-    story.append(HRFlowable(width="100%", thickness=1.5,
-                             color=ACCENT, spaceAfter=8))
-    story.append(Paragraph(
-        f"This assessment was conducted against the <b>{meta['network']}</b> "
-        f"network on <b>{meta['scan_date']}</b> using Network Scanner v0.6. "
-        f"The following techniques were employed:", ST["body"]))
-    story.append(Spacer(1, 0.08*inch))
 
-    method_items = [
-        ("Host Discovery",
+    # ── Scope & Methodology ───────────────────────────────────────────────────
+    story.append(Paragraph("Scope & Methodology", ST["h1"]))
+    story.append(Paragraph(
+        f"This assessment was conducted against the {meta['network']} "
+        f"network on {meta['scan_date']} using Network Scanner v0.6. "
+        f"The following techniques were employed:", ST["body"]))
+
+    meth_data = [
+        ["Technique", "Description"],
+        ["Host Discovery",
          "TCP connect probes on ports 22, 80, 443, and 445 to identify "
          "live hosts. A host is considered active if any probe port "
-         "responds — including connection refused responses."),
-        ("Port Scanning",
-         "TCP full-connect scan against 19 commonly exploited ports per host. "
-         "Ports are classified as open, closed, or filtered based on "
-         "connection response."),
-        ("Banner Grabbing",
-         "Service banners collected from all open ports to identify software "
-         "names and version numbers. HTTP/HTTPS services queried with HEAD "
-         "requests; passive services listened for initial banner data."),
-        ("CVE Correlation",
+         "responds — including connection refused responses."],
+        ["Port Scanning",
+         "TCP full-connect scan against 19 commonly exploited ports per "
+         "host. Ports are classified as open, closed, or filtered based "
+         "on connection response."],
+        ["Banner Grabbing",
+         "Service banners collected from all open ports to identify "
+         "software names and version numbers. HTTP/HTTPS services queried "
+         "with HEAD requests; passive services listened for initial banner "
+         "data."],
+        ["CVE Correlation",
          "Service version strings parsed and queried against the National "
-         "Vulnerability Database (NVD) API v2.0. Up to 5 CVEs returned per "
-         "service, sorted by CVSS score descending."),
-        ("Scope Limitation",
+         "Vulnerability Database (NVD) API v2.0. Up to 5 CVEs returned "
+         "per service, sorted by CVSS score descending."],
+        ["Scope Limitation",
          "This scan covers TCP ports only. UDP services, web application "
          "vulnerabilities, authentication weaknesses, and physical security "
-         "are outside the scope of this assessment."),
+         "are outside the scope of this assessment."],
     ]
-    meth_rows = [[Paragraph("Technique", ST["th"]),
-                  Paragraph("Description", ST["th"])]]
-    for tech, desc in method_items:
-        meth_rows.append([
-            Paragraph(tech, ParagraphStyle("mtech", fontSize=9,
-                textColor=ACCENT, fontName="Helvetica-Bold", leading=13)),
-            Paragraph(desc, ST["td"]),
-        ])
-    meth_t = Table(meth_rows, colWidths=[1.5*inch, 5.7*inch])
-    meth_t.setStyle(TableStyle([
-        ("BACKGROUND",    (0,0),(-1,0),  NAVY),
-        ("ROWBACKGROUNDS",(0,1),(-1,-1), [WHITE, BG_ROW]),
-        ("TOPPADDING",    (0,0),(-1,-1), 7),
-        ("BOTTOMPADDING", (0,0),(-1,-1), 7),
-        ("LEFTPADDING",   (0,0),(-1,-1), 10),
-        ("RIGHTPADDING",  (0,0),(-1,-1), 10),
-        ("GRID",          (0,0),(-1,-1), 0.4, BORDER),
-        ("VALIGN",        (0,0),(-1,-1), "TOP"),
-    ]))
+    meth_t = Table(meth_data, colWidths=[1.4*inch, 4.9*inch])
+    meth_t.setStyle(table_style())
     story.append(meth_t)
     story.append(Spacer(1, 0.2*inch))
     story.append(Paragraph(
@@ -1668,7 +1416,7 @@ def generate_reports(enriched_results, network_range,
                      generate_pdf=True,
                      consultant_name="Your Name",
                      consultant_contact="your@email.com"):
-    """Generate JSON, HTML, and (optionally) PDF client audit report."""
+    """Generate JSON, HTML, and optionally PDF client audit report."""
     print("\n[*] Generating reports")
     print("-" * 50)
     report_data = prepare_report_data(enriched_results, network_range)
@@ -1755,64 +1503,55 @@ def print_banner_results(port_scan_results):
 def main():
     import argparse
 
-    # argparse is Python's standard library for handling command line arguments.
-    # It automatically generates --help output and handles errors cleanly.
     parser = argparse.ArgumentParser(
         prog="scanner.py",
-        description="Network Scanner v0.5 — AUTHORIZED USE ONLY",
+        description="Network Scanner v0.6 — AUTHORIZED USE ONLY",
         epilog="Only scan networks you own or have explicit permission to scan."
     )
 
-    # Positional argument — required, no flag needed
-    # python3 scanner.py 192.168.226.0/24
     parser.add_argument(
         "network",
-        nargs="?",          # Makes it optional so we can prompt if missing
+        nargs="?",
         help="Target network range in CIDR notation (e.g. 192.168.1.0/24)"
     )
-
-    # Optional flag — custom output directory
-    # python3 scanner.py 192.168.226.0/24 --output ~/scans/engagement1
     parser.add_argument(
         "--output", "-o",
         metavar="DIR",
-        help="Directory to save reports (default: ~/projects/network-scanner/reports)"
+        help="Directory to save reports"
     )
-
-    # Optional flag — skip CVE correlation for faster scans
-    # python3 scanner.py 192.168.226.0/24 --no-cve
     parser.add_argument(
         "--no-cve",
-        action="store_true",    # Flag only, no value needed — True if present
-        help="Skip CVE correlation (faster scans, no NVD queries)"
+        action="store_true",
+        help="Skip CVE correlation (faster scans)"
     )
-
-    # Optional flag — show closed ports in terminal output
     parser.add_argument(
         "--show-closed",
         action="store_true",
         help="Show closed ports in port scan results"
     )
-
-    # Optional flag — skip PDF report generation
     parser.add_argument(
         "--no-pdf",
         action="store_true",
         help="Skip PDF client audit report generation"
     )
-
-    # Optional flags — consultant info for PDF cover page
     parser.add_argument(
         "--name",
         metavar="NAME",
-        default="Your Name",
-        help="Your name for the PDF report cover (default: 'Your Name')"
+        default="Jeffrey Hidalgo",
+        help="Your name for the PDF report cover"
     )
     parser.add_argument(
         "--contact",
         metavar="EMAIL",
-        default="your@email.com",
+        default="jhida.sec@gmail.com",
         help="Your contact info for the PDF report cover"
+    )
+    parser.add_argument(
+        "--client-id",
+        metavar="ID",
+        type=int,
+        default=None,
+        help="Client ID to associate this scan with in the database"
     )
 
     args = parser.parse_args()
@@ -1830,7 +1569,6 @@ def main():
 ╚══════════════════════════════════════╝
     """)
 
-    # Get network range — from arg or prompt
     if args.network:
         network_range = args.network
     else:
@@ -1840,19 +1578,16 @@ def main():
     if not is_authorized(network_range):
         print(f"\n[!] ERROR: {network_range} is not in your authorized "
               f"targets list.")
-        print("[!] Add it to AUTHORIZED_NETWORKS only if you own it.")
+        print("[!] Add it to networks.conf only if you own it.")
         print("[!] Unauthorized scanning is illegal. Exiting.\n")
         sys.exit(1)
 
-    # Apply custom output directory if specified.
-    # We modify the global REPORTS_DIR so all report functions
-    # automatically use it without needing to pass it around.
     if args.output:
         global REPORTS_DIR
         REPORTS_DIR = Path(args.output).expanduser().resolve()
         print(f"[*] Output directory: {REPORTS_DIR}")
 
-    # Stage 1 — host discovery
+    # Stage 1
     found = discover_hosts(network_range)
     print_discovery_results()
 
@@ -1860,15 +1595,15 @@ def main():
         print("[-] No live hosts found. Exiting.\n")
         sys.exit(0)
 
-    # Stage 2 — port scan
+    # Stage 2
     port_results = run_port_scan(found)
     print_port_results(port_results, show_closed=args.show_closed)
 
-    # Stage 3 — banner grab
+    # Stage 3
     enriched_results = run_banner_grab(port_results)
     print_banner_results(enriched_results)
 
-    # Stage 5 — CVE correlation (skippable with --no-cve)
+    # Stage 5
     if args.no_cve:
         print("\n[*] Skipping CVE correlation (--no-cve flag set)")
         for host, data in enriched_results.items():
@@ -1877,16 +1612,19 @@ def main():
         enriched_results = run_cve_correlation(enriched_results)
         print_cve_results(enriched_results)
 
-    # Stage 4 — generate reports
+    # Stage 4
     generate_reports(enriched_results, network_range,
                      generate_pdf=not args.no_pdf,
                      consultant_name=args.name,
                      consultant_contact=args.contact)
-    # Save to database if available
+
+    # Database save
     if DB_AVAILABLE:
-        save_scan(enriched_results, network_range, client_id=None)
+        save_scan(enriched_results, network_range,
+                  client_id=args.client_id)
     else:
         print("[*] Database not configured — skipping db save")
+
 
 if __name__ == "__main__":
     main()

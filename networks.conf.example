@@ -1,0 +1,12 @@
+# networks.conf.example
+# Copy this file to networks.conf and add your authorized networks.
+# networks.conf is gitignored and will never be committed.
+#
+# Format: one CIDR range per line
+# Comments start with #
+# Blank lines are ignored
+#
+# Examples:
+# 192.168.1.0/24       # Home lab
+# 10.0.0.0/24          # VM network
+# 172.16.0.0/24        # Client A - authorized 2026-01-01
