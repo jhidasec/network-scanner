@@ -76,3 +76,11 @@ network-scanner/
 This tool is intended for authorized penetration testing and security research 
 only. The author assumes no liability for misuse. Always obtain written 
 permission before scanning any network.
+## Part of the jhidasec toolkit
+
+- [Network Scanner](https://github.com/jhidasec/network-scanner) — host 
+  discovery, port scanning, banner grabbing, CVE correlation
+- [Email Security Checker](https://github.com/jhidasec/email-security-checker) 
+  — SPF, DKIM, DMARC analysis with bulk checking and PDF reports
+- [SMB Security Assessment](https://github.com/jhidasec/smb-security-assessment) 
+  — field assessment tool with CIS Controls alignment and PDF reporting
